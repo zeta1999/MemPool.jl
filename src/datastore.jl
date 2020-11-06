@@ -13,6 +13,18 @@ mutable struct DRef
     end
 end
 
+function Serialization.serialize(io::AbstractSerializer, d::DRef)
+    Serialization.serialize_cycle_header(io, d)
+    serialize(io, d.owner)
+    serialize(io, d.id)
+    serialize(io, d.size)
+
+    pid = Distributed.worker_id_from_socket(io.io)
+    if pid == -1
+        @warn "Couldn't determine destination for DRef serialization\nRefcounting will be broken"
+    end
+    pooltransfer_send(d, pid)
+end
 function Serialization.deserialize(io::AbstractSerializer, dt::Type{DRef})
     # Construct the object
     nf = fieldcount(dt)
@@ -25,7 +37,7 @@ function Serialization.deserialize(io::AbstractSerializer, dt::Type{DRef})
         end
     end
     # Add a new reference manually, and unref on finalization
-    poolref(d)
+    poolref(d, true)
     finalizer(poolunref, d)
     d
 end
@@ -42,64 +54,158 @@ using .Threads
 const datastore = Dict{Int,RefState}()
 const datastore_lock = Ref{Union{Nothing, ReentrantLock}}(nothing)
 const id_counter = Ref{Union{Nothing, Atomic{Int}}}(nothing)
-const datastore_counter = Dict{Tuple{Int,Int}, Atomic{Int}}()
+const datastore_counter = Dict{Tuple{Int,Int}, Atomic{Int}}() # TODO: We don't need owner
 const local_datastore_counter = Dict{Tuple{Int,Int}, Atomic{Int}}()
+const send_datastore_counter = Dict{Tuple{Int,Int}, Dict{Int,Atomic{Int}}}()
+const recv_datastore_counter = Dict{Tuple{Int,Int}, Dict{Int,Atomic{Int}}}()
 
-function poolref(d::DRef)
+# TODO: Remove me
+show_counters(d::DRef) = @everywhere [1,workers()...] MemPool.show_counters($(d.owner), $(d.id))
+function show_counters(owner, id)
+    key = (owner, id)
+    haskey(datastore_counter, key) && @show datastore_counter[key]
+    haskey(local_datastore_counter, key) && @show local_datastore_counter[key]
+    haskey(send_datastore_counter, key) && @show send_datastore_counter[key]
+    haskey(recv_datastore_counter, key) && @show recv_datastore_counter[key]
+    nothing
+end
+
+function canfree(id)
+    owner = myid()
+    datastore_counter[(owner, id)][] != 0 && return false
+    if haskey(recv_datastore_counter, (owner, id))
+        dict = recv_datastore_counter[(owner, id)]
+        for pid in keys(dict)
+            dict[pid][] != 0 && return false
+        end
+    end
+    return true
+end
+
+function clear_counters!(id)
+    owner = myid()
+    haskey(datastore_counter, (owner, id)) &&
+        delete!(datastore_counter, (owner, id))
+    haskey(local_datastore_counter, (owner, id)) &&
+        delete!(local_datastore_counter, (owner, id))
+    haskey(recv_datastore_counter, (owner, id)) &&
+        delete!(recv_datastore_counter, (owner, id))
+end
+
+# HACK: Force remote GC messages to be executed serially
+const SEND_QUEUE = Channel(typemax(Int))
+const SEND_TASK = Ref{Task}()
+function _enqueue_work(f, args...)
+    if !isassigned(SEND_TASK)
+        SEND_TASK[] = @async begin
+            while true
+                try
+                    work, _args = take!(SEND_QUEUE)
+                    work(_args...)
+                catch err
+                    println(stderr, "Error in enqueued work:")
+                    Base.showerror(stderr, err)
+                    Base.show_backtrace(stderr, catch_backtrace())
+                end
+            end
+        end
+    end
+    put!(SEND_QUEUE, (f, args))
+end
+
+function poolref(d::DRef, recv=false)
     with_datastore_lock() do
         ctr = get!(local_datastore_counter, (d.owner,d.id)) do
             # We've never seen this DRef, so tell the owner
             if d.owner == myid()
-                poolref_owner(d)
+                poolref_owner(d.id)
             else
-                @static if VERSION >= v"1.3.0-DEV.573"
-                    Threads.@spawn remotecall(poolref_owner, d.owner, d)
-                else
-                    @async remotecall(poolref_owner, d.owner, d)
-                end
+                _enqueue_work(remotecall_wait, poolref_owner, d.owner, d.id)
             end
             Atomic{Int}(0)
         end
+        # We've received this DRef via transfer
+        if recv
+            _enqueue_work(remotecall_wait, pooltransfer_recv, d.owner, d.id, myid())
+        end
+        # Update the local refcount
         atomic_add!(ctr, 1)
     end
 end
-"Called on owner when a worker first holds a reference to `d`."
-function poolref_owner(d::DRef)
+"Called on owner when a worker first holds a reference to DRef with ID `id`."
+function poolref_owner(id::Int)
     with_datastore_lock() do
-        ctr = get!(datastore_counter, (d.owner,d.id)) do
+        ctr = get!(datastore_counter, (myid(),id)) do
             Atomic{Int}(0)
         end
         atomic_add!(ctr, 1)
+        if canfree(id)
+            clear_counters!(id)
+            datastore_delete(id)
+        end
     end
 end
-function poolunref(d::DRef)
-    @assert haskey(local_datastore_counter, (d.owner,d.id)) "poolunref called before any poolref"
+function poolunref(d::DRef, to_pid=0)
+    @assert haskey(local_datastore_counter, (d.owner,d.id)) "poolunref called before any poolref $(myid()): ($(d.owner),$(d.id))"
     with_datastore_lock() do
         ctr = local_datastore_counter[(d.owner,d.id)]
         atomic_sub!(ctr, 1)
-        if ctr[] <= 0
+        if ctr[] == 0
             delete!(local_datastore_counter, (d.owner,d.id))
+            transfers = get(send_datastore_counter, (d.owner,d.id), Dict{Int,Atomic{Int}}())
+            delete!(send_datastore_counter, (d.owner,d.id))
             # Tell the owner we hold no more references
             if d.owner == myid()
-                poolunref_owner(d)
+                poolunref_owner(d.id, transfers)
             else
-                @static if VERSION >= v"1.3.0-DEV.573"
-                    Threads.@spawn remotecall(poolunref_owner, d.owner, d)
-                else
-                    @async remotecall(poolunref_owner, d.owner, d)
-                end
+                _enqueue_work(remotecall_wait, poolunref_owner, d.owner, d.id, transfers)
             end
         end
     end
 end
-"Called on owner when a worker no longer holds any references to `d`."
-function poolunref_owner(d::DRef)
-    @assert haskey(datastore_counter, (d.owner,d.id)) "poolunref_owner called before any poolref_owner"
-    ctr = datastore_counter[(d.owner,d.id)]
-    atomic_sub!(ctr, 1)
-    if ctr[] <= 0
-        delete!(datastore_counter, (d.owner,d.id))
-        datastore_delete(d.id)
+"Called on owner when a worker no longer holds any references to DRef with ID `id`."
+function poolunref_owner(id::Int, transfers::Dict{Int,Atomic{Int}})
+    with_datastore_lock() do
+        @assert haskey(datastore_counter, (myid(),id)) "poolunref_owner called before any poolref_owner"
+        ctr = datastore_counter[(myid(),id)]
+        atomic_sub!(ctr, 1)
+        rctr = get!(recv_datastore_counter, (myid(),id)) do
+            Dict{Int,Atomic{Int}}()
+        end
+        for pid in keys(transfers)
+            recv_ctr = get!(rctr, pid, Atomic{Int}(0))
+            atomic_add!(recv_ctr, transfers[pid][])
+        end
+        if canfree(id)
+            clear_counters!(id)
+            datastore_delete(id)
+        end
+    end
+end
+function pooltransfer_send(d::DRef, to_pid::Int)
+    with_datastore_lock() do
+        dict = get!(send_datastore_counter, (d.owner,d.id)) do
+            Dict{Int,Atomic{Int}}()
+        end
+        ctr = get!(dict, to_pid) do
+            Atomic{Int}(0)
+        end
+        atomic_add!(ctr, 1)
+    end
+end
+function pooltransfer_recv(id::Int, to_pid::Int)
+    with_datastore_lock() do
+        dict = get!(recv_datastore_counter, (myid(),id)) do
+            Dict{Int,Atomic{Int}}()
+        end
+        ctr = get!(dict, to_pid) do
+            Atomic{Int}(0)
+        end
+        atomic_sub!(ctr, 1)
+        if canfree(id)
+            clear_counters!(id)
+            datastore_delete(id)
+        end
     end
 end
 
